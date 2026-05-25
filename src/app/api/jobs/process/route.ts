@@ -1,24 +1,15 @@
 /**
  * GET /api/jobs/process
  *
- * Worker endpoint para procesar jobs de recordatorio de email.
- * Llamado por un cron externo cada ~5 minutos.
+ * Worker endpoint para procesar recordatorios de email pendientes.
+ * Llamado por cron-job.org cada 5 minutos.
  *
- * Autenticación: Bearer token via Authorization header o ?secret= en query.
- *
- * Configuración Vercel Cron (vercel.json):
- * {
- *   "crons": [{ "path": "/api/jobs/process", "schedule": "* /5 * * * *" }]
- * }
- * (Vercel Cron añade automáticamente el header Authorization: Bearer <CRON_SECRET>)
- *
- * Variables de entorno requeridas:
- *   CRON_SECRET — string secreto para autenticar el endpoint
+ * Autenticación: ?secret=<CRON_SECRET>
+ * O bien: Authorization: Bearer <CRON_SECRET>
  */
 
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getBoss, JOB_EMAIL_REMINDER, type ReminderJobData } from "@/lib/boss";
 import { sendReminderEmail } from "@/lib/email";
 import { safeDecrypt } from "@/lib/encryption";
 import { getISOWeek } from "@/lib/iso-week";
@@ -29,17 +20,12 @@ function isAuthorized(request: Request): boolean {
   const secret = process.env.CRON_SECRET;
   if (!secret) {
     console.warn("[cron] CRON_SECRET no configurado — endpoint desprotegido");
-    return true; // Permitir en dev sin secret
+    return true;
   }
-
-  // Vercel Cron: Authorization: Bearer <secret>
   const authHeader = request.headers.get("authorization");
   if (authHeader === `Bearer ${secret}`) return true;
-
-  // Alternativa: ?secret=... (para pruebas manuales)
   const url = new URL(request.url);
   if (url.searchParams.get("secret") === secret) return true;
-
   return false;
 }
 
@@ -48,26 +34,33 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: "No autorizado" }, { status: 401 });
   }
 
-  const boss = await getBoss();
-  // pg-boss v9+: fetch(name, options)
-  const jobs = await boss.fetch<ReminderJobData>(JOB_EMAIL_REMINDER, { batchSize: BATCH_SIZE });
+  // Tomar recordatorios pendientes cuya hora de envío ya llegó
+  const pending = await prisma.scheduledReminder.findMany({
+    where: {
+      sentAt: null,
+      sendAt: { lte: new Date() },
+    },
+    take: BATCH_SIZE,
+    orderBy: { sendAt: "asc" },
+  });
 
-  if (!jobs || jobs.length === 0) {
-    return NextResponse.json({ processed: 0, message: "Sin jobs pendientes" });
+  if (pending.length === 0) {
+    return NextResponse.json({ processed: 0, message: "Sin recordatorios pendientes" });
   }
 
   let processed = 0;
   let failed = 0;
 
-  for (const job of jobs) {
+  for (const reminder of pending) {
     try {
-      await processReminderJob(job.data);
-      await boss.complete(JOB_EMAIL_REMINDER, job.id);
+      await processReminder(reminder.reservationId, reminder.type as "24h" | "1h");
+      await prisma.scheduledReminder.update({
+        where: { id: reminder.id },
+        data: { sentAt: new Date() },
+      });
       processed++;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "Error desconocido";
-      console.error(`[cron] Job ${job.id} falló:`, msg);
-      await boss.fail(JOB_EMAIL_REMINDER, job.id, { message: msg });
+      console.error(`[cron] Recordatorio ${reminder.id} falló:`, err);
       failed++;
     }
   }
@@ -75,12 +68,7 @@ export async function GET(request: Request) {
   return NextResponse.json({ processed, failed });
 }
 
-// ─── Procesamiento de un job de recordatorio ──────────────────────────────────
-
-async function processReminderJob(data: ReminderJobData): Promise<void> {
-  const { reservationId, type } = data;
-
-  // Obtener reserva con toda la info necesaria
+async function processReminder(reservationId: string, type: "24h" | "1h"): Promise<void> {
   const reservation = await prisma.reservation.findUnique({
     where: { id: reservationId },
     include: {
@@ -101,26 +89,17 @@ async function processReminderJob(data: ReminderJobData): Promise<void> {
     return;
   }
 
-  // Si la reserva ya no está confirmada, no enviar
   if (reservation.status !== "CONFIRMED") {
     console.info(`[cron] Reserva ${reservationId} en estado ${reservation.status}, saltando.`);
     return;
   }
 
-  // Resolver email y nombre — puede ser reserva de invitado (guestEmail) o participante con cuenta
   const recipientEmail =
-    reservation.guestEmail ??
-    reservation.participant?.user.email ??
-    null;
-
+    reservation.guestEmail ?? reservation.participant?.user.email ?? null;
   const recipientName =
-    reservation.guestName ??
-    reservation.participant?.user.name ??
-    "";
-
+    reservation.guestName ?? reservation.participant?.user.name ?? "";
   const courseName =
-    reservation.participant?.course.name ??
-    reservation.licenseAccount.tool.name;
+    reservation.participant?.course.name ?? reservation.licenseAccount.tool.name;
 
   if (!recipientEmail) {
     console.warn(`[cron] Reserva ${reservationId} sin email destinatario, saltando.`);
@@ -150,16 +129,12 @@ async function processReminderJob(data: ReminderJobData): Promise<void> {
       }
     : null;
 
-  // Recordatorio de 1h sin credenciales → no enviar (no tiene sentido sin acceso)
+  // No enviar recordatorio de 1h sin credenciales
   if (type === "1h" && !credential) {
-    console.info(`[cron] Recordatorio 1h de reserva ${reservationId} omitido — sin credenciales para la semana ${weekLabel}.`);
+    console.info(`[cron] Recordatorio 1h de ${reservationId} omitido — sin credenciales para ${weekLabel}.`);
     return;
   }
 
-  // Reconstruir cancelToken desde el hash no es posible — se omite en recordatorios
-  // (el participante ya recibió el link en el email de confirmación)
-
-  // Enviar email
   await sendReminderEmail(
     recipientEmail,
     {

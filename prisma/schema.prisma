@@ -274,8 +274,9 @@ model Reservation {
   shareLink      ShareLink?         @relation(fields: [shareLinkId], references: [id], onDelete: SetNull)
   licenseAccount LicenseAccount     @relation(fields: [licenseAccountId], references: [id])
   cancelledBy    User?              @relation("ReservationCanceller", fields: [cancelledById], references: [id])
-  emailLogs      EmailLog[]
-  calendarLogs   CalendarEventLog[]
+  emailLogs           EmailLog[]
+  calendarLogs        CalendarEventLog[]
+  scheduledReminders  ScheduledReminder[]
 
   @@index([participantId, startsAt])
   @@index([shareLinkId, startsAt])
@@ -332,6 +333,22 @@ model CalendarEventLog {
 
   reservation Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
 
+  @@index([reservationId])
+}
+
+// ---------- Jobs de recordatorio (reemplaza pg-boss) ----------
+
+model ScheduledReminder {
+  id            String    @id @default(cuid())
+  reservationId String
+  type          String    // "24h" | "1h"
+  sendAt        DateTime  @db.Timestamptz(6)
+  sentAt        DateTime? @db.Timestamptz(6)
+  createdAt     DateTime  @default(now())
+
+  reservation Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+
+  @@index([sendAt, sentAt])
   @@index([reservationId])
 }
 

@@ -1,44 +1,38 @@
 /**
- * Scheduling de jobs de recordatorio vía pg-boss.
- *
- * Se llama desde las acciones de servidor después de confirmar una reserva.
- * Los jobs son procesados por GET /api/jobs/process (cron).
+ * Scheduling de recordatorios vía tabla ScheduledReminder en Postgres.
+ * Reemplaza pg-boss — funciona correctamente en entornos serverless.
  */
 
-import { getBoss, JOB_EMAIL_REMINDER, type ReminderJobData } from "@/lib/boss";
+import { prisma } from "@/lib/prisma";
 
-/**
- * Programa los emails de recordatorio (24h y 1h antes del inicio).
- * No lanza excepciones: si falla el scheduling solo loguea el error.
- */
 export async function scheduleReminderEmails(
   reservationId: string,
   startsAt: Date
 ): Promise<void> {
-  const jobs: { type: ReminderJobData["type"]; offsetMs: number }[] = [
+  const jobs = [
     { type: "24h", offsetMs: 24 * 60 * 60 * 1000 },
     { type: "1h",  offsetMs:      60 * 60 * 1000 },
   ];
 
   try {
-    const boss = await getBoss();
+    const now = new Date();
+    const pending = jobs
+      .map(({ type, offsetMs }) => ({
+        type,
+        sendAt: new Date(startsAt.getTime() - offsetMs),
+      }))
+      .filter(({ sendAt }) => sendAt > now); // solo programar si aún no pasó
 
-    await Promise.all(
-      jobs.map(({ type, offsetMs }) => {
-        const startAfter = new Date(startsAt.getTime() - offsetMs);
+    if (pending.length === 0) return;
 
-        // Si la fecha ya pasó (reserva muy próxima), no programar
-        if (startAfter <= new Date()) return Promise.resolve();
-
-        const payload: ReminderJobData = { reservationId, type };
-        // pg-boss v9+: send(name, data, options)
-        return boss.send(JOB_EMAIL_REMINDER, payload, {
-          startAfter: startAfter.toISOString(),
-        });
-      })
-    );
+    await prisma.scheduledReminder.createMany({
+      data: pending.map(({ type, sendAt }) => ({
+        reservationId,
+        type,
+        sendAt,
+      })),
+    });
   } catch (err) {
-    // No bloqueamos la reserva si el scheduling falla
     console.error("[jobs] Error al programar recordatorios para", reservationId, err);
   }
 }
