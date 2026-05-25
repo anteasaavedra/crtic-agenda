@@ -1,0 +1,354 @@
+// CRTIC Agenda — schema de base de datos
+//
+// Notas importantes:
+// - Las restricciones EXCLUDE (anti-solapamiento) NO son expresables en Prisma.
+//   Se aplican vía SQL manual: prisma/sql/exclude_constraints.sql
+// - Las contraseñas de licencias y tokens OAuth se guardan como Bytes (cifrados AES-256-GCM).
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [btree_gist]
+}
+
+// ---------- Enums ----------
+
+enum Role {
+  ADMIN
+  PARTICIPANT
+}
+
+enum ParticipantStatus {
+  ACTIVE
+  SUSPENDED
+  REMOVED
+}
+
+enum ReservationStatus {
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+  NO_SHOW
+}
+
+enum CalendarTarget {
+  PARTICIPANT
+  ADMIN
+}
+
+enum CalendarAction {
+  CREATED
+  UPDATED
+  DELETED
+  FAILED
+}
+
+enum EmailStatus {
+  QUEUED
+  SENT
+  FAILED
+  BOUNCED
+}
+
+// ---------- Usuarios y cuentas ----------
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String?
+  role         Role      @default(PARTICIPANT)
+  passwordHash String?
+  createdAt    DateTime  @default(now())
+  lastLoginAt  DateTime?
+
+  participants     Participant[]
+  coursesCreated   Course[]           @relation("CourseCreator")
+  credentialsAdded WeeklyCredential[]
+  cancellations    Reservation[]      @relation("ReservationCanceller")
+  auditEntries     AuditLog[]
+  googleAccount    GoogleAccount?
+
+  @@index([role])
+}
+
+model GoogleAccount {
+  id                    String    @id @default(cuid())
+  userId                String    @unique
+  accessTokenEncrypted  Bytes
+  refreshTokenEncrypted Bytes
+  scope                 String
+  expiryDate            DateTime
+  calendarId            String?
+  lastRefreshedAt       DateTime?
+  createdAt             DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Cursos y participantes ----------
+
+model Course {
+  id                      String   @id @default(cuid())
+  name                    String
+  slug                    String   @unique
+  description             String?
+  startsOn                DateTime @db.Date
+  endsOn                  DateTime @db.Date
+  maxReservationsPerWeek  Int?
+  maxReservationsPerDay   Int?
+  reservationWindowDays   Int      @default(14)
+  allowCancellation       Boolean  @default(true)
+  cancellationCutoffHours Int      @default(2)
+  createdById             String
+  createdAt               DateTime @default(now())
+
+  createdBy    User          @relation("CourseCreator", fields: [createdById], references: [id])
+  participants Participant[]
+  tools        CourseTool[]
+
+  @@index([createdById])
+}
+
+model Participant {
+  id       String            @id @default(cuid())
+  courseId String
+  userId   String
+  joinedAt DateTime          @default(now())
+  status   ParticipantStatus @default(ACTIVE)
+
+  course       Course        @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reservations Reservation[]
+  emailLogs    EmailLog[]
+
+  @@unique([courseId, userId])
+  @@index([courseId])
+  @@index([userId])
+}
+
+// ---------- Herramientas y licencias ----------
+
+enum ToolCategory {
+  LICENCIA
+  MENTORIA
+}
+
+model Tool {
+  id                    String       @id @default(cuid())
+  name                  String
+  slug                  String       @unique
+  description           String?
+  instructionsMd        String?
+  iconUrl               String?
+  accessUrl             String?      // URL de acceso a la plataforma (ej. https://krea.ai)
+  isActive              Boolean      @default(true)
+  category              ToolCategory @default(LICENCIA)
+  defaultSlotMinutes    Int          @default(120)
+  maxReservationMinutes Int          @default(120)
+  createdAt             DateTime     @default(now())
+
+  courses    CourseTool[]
+  licenses   LicenseAccount[]
+  shareLinks ShareLink[]
+
+  @@index([category, isActive])
+}
+
+// ---------- Links de reserva pública (sin cuenta) ----------
+
+model ShareLink {
+  id                String    @id @default(cuid())
+  toolId            String
+  licenseAccountId  String?   // Si está seteado, solo permite reservar esa licencia específica
+  token             String    @unique
+  label             String
+  isActive          Boolean   @default(true)
+  expiresAt         DateTime? @db.Timestamptz(6)
+  maxPerWeekEmail   Int       @default(3)
+  cancelCutoffHrs   Int       @default(1)
+  createdAt         DateTime  @default(now())
+  revokedAt         DateTime? @db.Timestamptz(6)
+
+  tool           Tool            @relation(fields: [toolId], references: [id], onDelete: Cascade)
+  licenseAccount LicenseAccount? @relation(fields: [licenseAccountId], references: [id], onDelete: SetNull)
+  reservations   Reservation[]
+
+  @@index([toolId])
+  @@index([token])
+  @@index([licenseAccountId])
+}
+
+model CourseTool {
+  courseId String
+  toolId   String
+
+  course Course @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  tool   Tool   @relation(fields: [toolId], references: [id], onDelete: Cascade)
+
+  @@id([courseId, toolId])
+  @@index([toolId])
+}
+
+model LicenseAccount {
+  id           String   @id @default(cuid())
+  toolId       String
+  label        String
+  accountEmail String?
+  notes        String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  tool              Tool               @relation(fields: [toolId], references: [id], onDelete: Cascade)
+  weeklyCredentials WeeklyCredential[]
+  availability      AvailabilitySlot[]
+  reservations      Reservation[]
+  shareLinks        ShareLink[]
+
+  @@index([toolId])
+}
+
+model WeeklyCredential {
+  id                   String   @id @default(cuid())
+  licenseAccountId     String
+  isoYear              Int
+  isoWeek              Int
+  validFrom            DateTime
+  validUntil           DateTime
+  usernameEncrypted    Bytes
+  passwordEncrypted    Bytes
+  encryptionKeyVersion Int      @default(1)
+  createdById          String
+  createdAt            DateTime @default(now())
+
+  licenseAccount LicenseAccount @relation(fields: [licenseAccountId], references: [id], onDelete: Cascade)
+  createdBy      User           @relation(fields: [createdById], references: [id])
+
+  @@unique([licenseAccountId, isoYear, isoWeek])
+  @@index([licenseAccountId, validFrom, validUntil])
+}
+
+// ---------- Disponibilidad y reservas ----------
+
+model AvailabilitySlot {
+  id               String   @id @default(cuid())
+  licenseAccountId String
+  startsAt         DateTime @db.Timestamptz(6)
+  endsAt           DateTime @db.Timestamptz(6)
+  isBlocked        Boolean  @default(false)
+  reason           String?
+  createdAt        DateTime @default(now())
+
+  licenseAccount LicenseAccount @relation(fields: [licenseAccountId], references: [id], onDelete: Cascade)
+
+  @@index([licenseAccountId, startsAt])
+}
+
+model Reservation {
+  id                       String            @id @default(cuid())
+  // Reserva clásica (vía participante con cuenta) o vía link público (guest).
+  participantId            String?
+  shareLinkId              String?
+  guestName                String?
+  guestEmail               String?
+  // Hash del token de cancelación enviado en el email (HMAC).
+  cancelTokenHash          String?
+  licenseAccountId         String
+  startsAt                 DateTime          @db.Timestamptz(6)
+  endsAt                   DateTime          @db.Timestamptz(6)
+  status                   ReservationStatus @default(CONFIRMED)
+  googleEventIdParticipant String?
+  googleEventIdAdmin       String?
+  meetLink                 String?           // Google Meet link (solo mentorías)
+  cancelledAt              DateTime?
+  cancelledById            String?
+  cancellationReason       String?
+  createdAt                DateTime          @default(now())
+  updatedAt                DateTime          @updatedAt
+
+  participant    Participant?       @relation(fields: [participantId], references: [id], onDelete: SetNull)
+  shareLink      ShareLink?         @relation(fields: [shareLinkId], references: [id], onDelete: SetNull)
+  licenseAccount LicenseAccount     @relation(fields: [licenseAccountId], references: [id])
+  cancelledBy    User?              @relation("ReservationCanceller", fields: [cancelledById], references: [id])
+  emailLogs      EmailLog[]
+  calendarLogs   CalendarEventLog[]
+
+  @@index([participantId, startsAt])
+  @@index([shareLinkId, startsAt])
+  @@index([guestEmail, startsAt])
+  @@index([licenseAccountId, startsAt])
+  @@index([status, startsAt])
+}
+
+// ---------- Auth de participantes ----------
+
+model MagicLinkToken {
+  id        String    @id @default(cuid())
+  email     String
+  token     String    @unique
+  expiresAt DateTime  @db.Timestamptz(6)
+  usedAt    DateTime? @db.Timestamptz(6)
+  createdAt DateTime  @default(now())
+
+  @@index([email])
+}
+
+// ---------- Logs ----------
+
+model EmailLog {
+  id                String      @id @default(cuid())
+  toEmail           String
+  template          String
+  subject           String
+  reservationId     String?
+  participantId     String?
+  providerMessageId String?
+  status            EmailStatus @default(QUEUED)
+  attempts          Int         @default(0)
+  lastError         String?
+  sentAt            DateTime?
+  createdAt         DateTime    @default(now())
+
+  reservation Reservation? @relation(fields: [reservationId], references: [id])
+  participant Participant? @relation(fields: [participantId], references: [id])
+
+  @@index([reservationId])
+  @@index([participantId])
+  @@index([status])
+}
+
+model CalendarEventLog {
+  id             String         @id @default(cuid())
+  reservationId  String
+  calendarTarget CalendarTarget
+  googleEventId  String?
+  action         CalendarAction
+  errorMessage   String?
+  performedAt    DateTime       @default(now())
+
+  reservation Reservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+
+  @@index([reservationId])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  entityType String
+  entityId   String?
+  metadata   Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@index([actorId, createdAt])
+  @@index([entityType, entityId])
+  @@index([action, createdAt])
+}
